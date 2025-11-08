@@ -45,18 +45,32 @@ export async function setupVite(app: Express, server: Server) {
     const url = req.originalUrl;
 
     try {
+      // Use process.cwd() as fallback if import.meta.dirname is not available
+      // import.meta.dirname is available in Node.js 20.11+
+      let baseDir = process.cwd();
+      try {
+        if (
+          "dirname" in import.meta &&
+          typeof (import.meta as any).dirname === "string"
+        ) {
+          baseDir = (import.meta as any).dirname;
+        }
+      } catch {
+        // Fallback to process.cwd() if import.meta.dirname is not available
+      }
+
       const clientTemplate = path.resolve(
-        import.meta.dirname,
+        baseDir,
         "..",
         "client",
-        "index.html",
+        "index.html"
       );
 
       // always reload the index.html file from disk incase it changes
       let template = await fs.promises.readFile(clientTemplate, "utf-8");
       template = template.replace(
         `src="/src/main.tsx"`,
-        `src="/src/main.tsx?v=${nanoid()}"`,
+        `src="/src/main.tsx?v=${nanoid()}"`
       );
       const page = await vite.transformIndexHtml(url, template);
       res.status(200).set({ "Content-Type": "text/html" }).end(page);
@@ -68,18 +82,71 @@ export async function setupVite(app: Express, server: Server) {
 }
 
 export function serveStatic(app: Express) {
-  const distPath = path.resolve(import.meta.dirname, "public");
+  // Try multiple possible locations for static files
+  // 1. dist/public (local build)
+  // 2. Relative to process.cwd() (Vercel might use this)
+  // 3. __dirname equivalent in ESM
 
-  if (!fs.existsSync(distPath)) {
-    throw new Error(
-      `Could not find the build directory: ${distPath}, make sure to build the client first`,
-    );
+  // Use process.cwd() as fallback if import.meta.dirname is not available
+  // import.meta.dirname is available in Node.js 20.11+
+  let baseDir = process.cwd();
+  try {
+    if (
+      "dirname" in import.meta &&
+      typeof (import.meta as any).dirname === "string"
+    ) {
+      baseDir = (import.meta as any).dirname;
+    }
+  } catch {
+    // Fallback to process.cwd() if import.meta.dirname is not available
   }
 
+  const possiblePaths = [
+    path.resolve(process.cwd(), "dist", "public"),
+    path.resolve(process.cwd(), "public"),
+    path.resolve(baseDir, "..", "dist", "public"),
+    path.resolve(baseDir, "public"),
+  ];
+
+  let distPath: string | null = null;
+
+  for (const testPath of possiblePaths) {
+    if (
+      fs.existsSync(testPath) &&
+      fs.existsSync(path.join(testPath, "index.html"))
+    ) {
+      distPath = testPath;
+      break;
+    }
+  }
+
+  if (!distPath) {
+    // In Vercel or if files don't exist, log warning but don't crash
+    // This allows the app to still work for API routes
+    log(
+      `Warning: Could not find the build directory. Tried: ${possiblePaths.join(
+        ", "
+      )}`
+    );
+    app.use("*", (_req, res) => {
+      res.status(404).json({
+        message: "Static files not found. Please build the client first.",
+        triedPaths: possiblePaths,
+      });
+    });
+    return;
+  }
+
+  log(`Serving static files from: ${distPath}`);
   app.use(express.static(distPath));
 
   // fall through to index.html if the file doesn't exist
   app.use("*", (_req, res) => {
-    res.sendFile(path.resolve(distPath, "index.html"));
+    const indexPath = path.resolve(distPath!, "index.html");
+    if (fs.existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      res.status(404).json({ message: "index.html not found" });
+    }
   });
 }
